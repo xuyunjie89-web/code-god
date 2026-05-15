@@ -1,0 +1,19 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# ChromaDB 本地向量库
+chroma_db/
+
+# 模型权重文件（太大了，队友各自下载）
+*/pytorch_model.bin
+*/tf_model.h5
+*/.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# 虚拟环境
+venv/
+env/
