@@ -139,6 +139,62 @@ def evaluate_strategy(name, test_queries, collection, clip_processor, clip_model
     return overall, by_type
 
 
+def evaluate_reranker_strategy(test_queries, collection, products,
+                                clip_processor, clip_model,
+                                bge_tokenizer, bge_model, reranker, alpha):
+    """混合+Reranker 策略: ChromaDB Top-50 → BGE-Reranker Cross-Encoder → Top-5"""
+    all_results = []
+    times = []
+
+    for q in test_queries:
+        t0 = time.time()
+
+        # 编码 (同混合检索)
+        ie = img_embed(q["image"], clip_processor, clip_model) if q.get("image") else [0.0] * 512
+        te = text_embed(q.get("text", ""), bge_tokenizer, bge_model)
+        query_emb = fuse(ie, te, alpha)
+        query_text = q.get("text", "")
+
+        # 粗排: ChromaDB Top-50
+        results = collection.query(query_embeddings=[query_emb], n_results=50)
+        ids = results["ids"][0]
+
+        # 精排: BGE-Reranker (仅当有文字 query 时；纯图 query 回退向量排序)
+        if query_text.strip():
+            pairs = []
+            for cid in ids:
+                prod = products.get(cid, {})
+                candidate_text = f"{prod.get('title', '')} {prod.get('description', '')}"
+                pairs.append([query_text, candidate_text])
+
+            scores = reranker.compute_score(pairs, normalize=True)
+            scored = sorted(zip(ids, scores), key=lambda x: x[1], reverse=True)
+            ranked_ids = [cid for cid, _ in scored[:5]]
+        else:
+            ranked_ids = ids[:5]
+
+        t = round((time.time() - t0) * 1000)
+        times.append(t)
+
+        qtype = q.get("type", "text")
+        all_results.append((ranked_ids, q["expect_id"], qtype))
+
+    overall = {
+        "recall@1": round(sum(recall_at_k(r, e, 1) for r, e, _ in all_results) / len(all_results) * 100, 1),
+        "recall@5": round(sum(recall_at_k(r, e, 5) for r, e, _ in all_results) / len(all_results) * 100, 1),
+        "mrr": round(sum(mrr(r, e) for r, e, _ in all_results) / len(all_results), 3),
+        "avg_ms": round(sum(times) / len(times)),
+    }
+
+    by_type = {}
+    for qt in ["text", "image", "image_text"]:
+        m = metrics_by_type(all_results, qt)
+        if m:
+            by_type[qt] = m
+
+    return overall, by_type
+
+
 def main():
     jsonl_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(MODEL_DIR, "data", "test_queries.jsonl")
 
@@ -163,6 +219,21 @@ def main():
     collection = client.get_or_create_collection("products")
     print(f"商品库: {collection.count()} 条\n")
 
+    # 加载 products.jsonl (id→description 映射，供 Reranker 使用)
+    products_path = os.path.join(MODEL_DIR, "data", "products.jsonl")
+    products = {}
+    if os.path.exists(products_path):
+        with open(products_path, encoding="utf-8") as f:
+            for line in f:
+                p = json.loads(line.strip())
+                products[p["id"]] = {"title": p.get("title", ""), "description": p.get("description", "")}
+
+    # 加载 BGE-Reranker (cross-encoder 精排)
+    print("加载 BGE-Reranker...")
+    from FlagEmbedding import FlagReranker
+    reranker = FlagReranker('BAAI/bge-reranker-v2-m3', use_fp16=True)
+    print("BGE-Reranker 就绪\n")
+
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if api_key:
         llm_client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
@@ -178,15 +249,22 @@ def main():
     ]
     if llm_client:
         strategies.append(("混合+LLM", ALPHA))
+    strategies.append(("混合+Reranker", ALPHA))
 
     all_overall = {}
     all_by_type = {}
 
     for name, alpha in strategies:
-        overall, by_type = evaluate_strategy(name, test_queries, collection,
-                                             clip_processor, clip_model,
-                                             bge_tokenizer, bge_model,
-                                             alpha=alpha, llm_client=llm_client)
+        if name == "混合+Reranker":
+            overall, by_type = evaluate_reranker_strategy(
+                test_queries, collection, products,
+                clip_processor, clip_model,
+                bge_tokenizer, bge_model, reranker, alpha)
+        else:
+            overall, by_type = evaluate_strategy(name, test_queries, collection,
+                                                 clip_processor, clip_model,
+                                                 bge_tokenizer, bge_model,
+                                                 alpha=alpha, llm_client=llm_client)
         all_overall[name] = overall
         all_by_type[name] = by_type
 
